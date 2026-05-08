@@ -359,18 +359,23 @@ def check_ssl_and_headers(url, session):
         pass
     return ssl_info, headers_info
 
-def dir_bust(url, session, wordlist, threads=10):
+def dir_bust(url, session, wordlist, threads=10, baseline=None):
     exposed_dirs = []
 
     def check_dir(word):
         test_url = urljoin(url, word)
         try:
             r = session.get(test_url, headers=get_random_headers(), timeout=5)
-            if r.status_code == 200:
+            # Baseline check to avoid false positives (e.g., all 404s returning 200 with same size)
+            if baseline and r.status_code == baseline['status'] and abs(len(r.text) - baseline['size']) < 100:
+                return None
+
+            if r.status_code < 400:
                 content = r.text.lower()
-                if not any(default in content for default in ["apache", "nginx", "iis", "404", "not found", "forbidden"]) or len(content) > 1000:
-                    console.print(f"[red]Exposed: [cyan]{test_url}[/cyan] (Status: {r.status_code}, Size: {len(content)})")
-                    return {"url": test_url, "status": r.status_code, "size": len(content)}
+                # Additional heuristic filter
+                if not any(default in content for default in ["404", "not found"]) or len(content) > 2000:
+                    console.print(f"[red]Exposed: [cyan]{test_url}[/cyan] (Status: {r.status_code}, Size: {len(r.text)})")
+                    return {"url": test_url, "status": r.status_code, "size": len(r.text)}
         except requests.RequestException:
             pass
         return None
@@ -505,7 +510,18 @@ def run_scan(target_url, threads=10, proxy=None, output_file=None):
     robots, sitemap = check_robots_and_sitemap(target_url, session)
     HARVESTED_DATA["robots_txt"] = robots
     HARVESTED_DATA["sitemap_xml"] = sitemap
-    HARVESTED_DATA["exposed_dirs"] = dir_bust(target_url, session, COMMON_DIRS, threads=threads)
+
+    # Establish baseline for 404s
+    baseline = None
+    try:
+        random_path = f"/{random.randint(100000, 999999)}_not_found"
+        r_base = session.get(urljoin(target_url, random_path), headers=get_random_headers(), timeout=5)
+        baseline = {"status": r_base.status_code, "size": len(r_base.text)}
+        console.print(f"[dim]Established 404 baseline: Status {baseline['status']}, Size {baseline['size']}[/dim]")
+    except:
+        pass
+
+    HARVESTED_DATA["exposed_dirs"] = dir_bust(target_url, session, COMMON_DIRS, threads=threads, baseline=baseline)
     ssl_info, headers_info = check_ssl_and_headers(target_url, session)
     HARVESTED_DATA["ssl_info"] = ssl_info
     HARVESTED_DATA["headers"] = headers_info
@@ -553,7 +569,7 @@ def run_scan(target_url, threads=10, proxy=None, output_file=None):
     # Discovered URLs
     urls = HARVESTED_DATA.get("all_urls", [])
     if urls:
-        url_list = "\n".join(urls[:20]) + ("\n... and more" if len(urls) > 20 else "")
+        url_list = "\n".join(urls)
         panel = Panel(url_list, title=f"Discovered URLs ({len(urls)} total)", border_style="blue")
         console.print(panel)
 
